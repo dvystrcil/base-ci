@@ -1,0 +1,115 @@
+name: base-ci
+
+# Reusable base CI: the shared guards every repo should run, behind ONE thin
+# caller per repo. A new shared guard is added here once, instead of being
+# wired into each repo by hand.
+#
+# What it runs:
+#   gitleaks                every PR and every push: dvystrcil/secret-scan-action@v1.
+#   detect-bot-direct-push  pushes to main only: calls this repo's
+#                           detect-bot-direct-push.yml (a nested reusable call).
+#
+# Callers: add one thin workflow in each repo, e.g. .github/workflows/base.yaml
+# (README.md has the public and private variants):
+#
+#   name: base
+#   on:
+#     pull_request:
+#     push:
+#       branches: [main]
+#   jobs:
+#     base:
+#       # The ceiling for every job below: a called workflow (and the one it
+#       # calls) can only narrow these, never widen them.
+#       permissions:
+#         contents: read
+#         pull-requests: read
+#         id-token: write          # only if the infisical-* inputs are set
+#       uses: dvystrcil/base-ci/.github/workflows/base-ci.yaml@v1
+#       with:
+#         runner-label: <repo>-runner   # omit entirely to use ubuntu-latest
+#
+# No `secrets:`: nothing here reads a caller secret. gitleaks uses the job's
+# own GITHUB_TOKEN, and the detector's optional alert logs in to Infisical by
+# GitHub OIDC.
+#
+# Check names a caller produces (a called job reports as
+# `<caller job> / <called job>`): with the caller job id `base` above,
+#   base / gitleaks                          (a standalone secret-scan.yml reports plain `gitleaks`)
+#   base / detect-bot-direct-push / check    (push to main only; `skipped` on PRs)
+# Rulesets require check names, so moving a repo from a standalone
+# secret-scan.yml to this workflow renames its required check: run both side
+# by side until `base / gitleaks` is required, then drop the old one.
+#
+# `runner-label` defaults to ubuntu-latest: a self-hosted scale set that
+# serves one repo can't be a shared default, and a wrong label queues forever
+# instead of failing. Public repos keep the default; private repos with
+# their own scale set pass `<repo>-runner`.
+#
+# The nested call is pinned to `dvystrcil/base-ci/...@v1`, not
+# `./.github/workflows/...`. GitHub documents the `./` form as "the called
+# workflow is from the same commit as the caller workflow" (docs.github.com,
+# "Reuse workflows"); for a nested call made on behalf of another repo that
+# sentence doesn't say whose repo, so the explicit owner/repo@ref is used.
+# Effect: a caller pinned to an exact base-ci tag or SHA still gets the
+# detector from the moving v1.
+#
+# GitHub limits this relies on (docs.github.com, "Reuse workflows" and
+# "Reusing workflow configurations"):
+#   - nesting: up to ten levels of workflows; this chain is three.
+#   - public caller repositories can call only workflows in public
+#     repositories, which is why this lives in a public repo.
+#   - permissions "can only be the same or more restrictive in nested
+#     workflows", so the caller must grant pull-requests: read (and
+#     id-token: write to alert).
+#   - the `github` context is the caller's, so github.event_name/github.ref
+#     below are the caller repo's push or PR.
+
+on:
+  workflow_call:
+    inputs:
+      runner-label:
+        description: runs-on label for every job; a private repo passes its own `<repo>-runner`.
+        type: string
+        required: false
+        default: ubuntu-latest
+      infisical-domain:
+        description: Passed to detect-bot-direct-push. Infisical API base URL reachable from the runner; empty = no Discord alert.
+        type: string
+        required: false
+        default: ''
+      infisical-project-slug:
+        description: Passed to detect-bot-direct-push. Empty = no Discord alert.
+        type: string
+        required: false
+        default: ''
+      infisical-identity-id:
+        description: Passed to detect-bot-direct-push (usually vars.INFISICAL_IDENTITY_ID). Empty = no Discord alert.
+        type: string
+        required: false
+        default: ''
+
+jobs:
+  # Job id `gitleaks`, as in the standalone secret-scan.yml: the caller's check
+  # is then `base / gitleaks`, the smallest rename from a required `gitleaks`.
+  gitleaks:
+    runs-on: ${{ inputs.runner-label }}
+    permissions:
+      contents: read
+      pull-requests: read  # gitleaks-action lists PR commits via the API
+    steps:
+      # Checkout (PR head SHA, full history) + gitleaks live in the action, so
+      # a fix ships to every repo by moving its v1.
+      - uses: dvystrcil/secret-scan-action@v1
+
+  detect-bot-direct-push:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # No permissions block: the caller job's grants pass through unchanged
+    # (contents: read, pull-requests: read, and id-token: write only when the
+    # caller alerts). Declaring id-token here would force it on every caller.
+    uses: dvystrcil/base-ci/.github/workflows/detect-bot-direct-push.yml@v1
+    with:
+      runner-label: ${{ inputs.runner-label }}
+      infisical-domain: ${{ inputs.infisical-domain }}
+      infisical-project-slug: ${{ inputs.infisical-project-slug }}
+      infisical-identity-id: ${{ inputs.infisical-identity-id }}

@@ -1,0 +1,206 @@
+name: detect-bot-direct-push
+
+# Reusable workflow: fail (and optionally alert) when a commit reaches main
+# without a merged PR, unless it comes from one of the two known direct
+# writers. Rulesets block direct pushes, so the only way to reach main
+# without a PR is a ruleset bypass actor; this is the alarm for a bypass
+# being used for something it wasn't granted for. It was written after an
+# agent committed a fix straight to main while its own PR was still open,
+# and continuous delivery deployed the unreviewed change within seconds.
+#
+# Home: dvystrcil/base-ci, referenced by the moving major tag `@v1` (our own
+# workflows go by semver tag, third-party actions by commit SHA). It is
+# normally reached through base-ci.yaml; a repo can also call it directly:
+#
+#   name: detect-bot-direct-push
+#   on:
+#     push:
+#       branches: [main]
+#   jobs:
+#     check:
+#       # The ceiling for this workflow's token: a called workflow can only
+#       # narrow its caller's permissions. id-token: write only if alerting.
+#       permissions:
+#         contents: read
+#         pull-requests: read
+#         id-token: write
+#       uses: dvystrcil/base-ci/.github/workflows/detect-bot-direct-push.yml@v1
+#       with:
+#         runner-label: <repo>-runner        # omit entirely to use ubuntu-latest
+#         # Optional Discord alert, all three or none:
+#         infisical-domain: ${{ vars.INFISICAL_DOMAIN }}
+#         infisical-project-slug: ${{ vars.INFISICAL_PROJECT_SLUG }}
+#         infisical-identity-id: ${{ vars.INFISICAL_IDENTITY_ID }}
+#
+# `runner-label` is an input, not hard-coded: a self-hosted scale set that
+# serves one repo can never serve another repo's job, and a job asking for a
+# label nobody serves queues forever instead of failing. Defaults to
+# `ubuntu-latest`, which always gets a runner.
+#
+# Alerting is optional. With the three infisical-* inputs set, a detected
+# push fetches DISCORD_WEBHOOK_CRITICAL (that one secret only) from the
+# Infisical instance by GitHub OIDC (`method: oidc`; the identity must trust
+# the CALLER repo's OIDC token, whose repository/repository_id claims are the
+# caller's even though this file lives here) and posts to Discord. The
+# Infisical host must be reachable from the runner. Without them, a detected
+# push still turns the run red; it just sends nothing. No caller secret is
+# read: pass no `secrets:`.
+#
+# How a push is judged. Every commit in the push is checked:
+#   - in a merged PR into main (GET commits/{sha}/pulls)  -> fine, whoever
+#     pushed it (auto-merged bump PRs are merged by dvystrcil-ci-cd[bot])
+#   - otherwise it is a direct commit, allowed only when ALL hold:
+#       release-action deploy: pusher dvystrcil-ci-cd[bot],
+#         author homelab-bump-bot, message "deploy: ..."
+#       argocd-image-updater write-back: pusher dvystrcil-argocd[bot],
+#         author argocd-image-updater, message "build: automatic update of ..."
+#     AND every changed line is a `newTag:` line.
+#   - anything else -> red run (+ Discord alert when configured).
+# The old check matched github.actor against `*-bot|*[Bb]ot`; `[Bb]` is a
+# bracket expression, so `name[bot]` App logins never matched and every App
+# direct push ran green.
+# API errors fail the run: a check that cannot see must not report green.
+
+on:
+  workflow_call:
+    inputs:
+      runner-label:
+        type: string
+        required: false
+        default: ubuntu-latest
+      infisical-domain:
+        description: Infisical API base URL (ending in /api), reachable from the runner. Empty = no alert.
+        type: string
+        required: false
+        default: ''
+      infisical-project-slug:
+        description: Infisical project slug holding DISCORD_WEBHOOK_CRITICAL. Empty = no alert.
+        type: string
+        required: false
+        default: ''
+      infisical-identity-id:
+        description: Infisical machine identity id with OIDC auth bound to the caller repo. Empty = no alert.
+        type: string
+        required: false
+        default: ''
+      infisical-env-slug:
+        description: Infisical environment slug.
+        type: string
+        required: false
+        default: prod
+
+jobs:
+  check:
+    runs-on: ${{ inputs.runner-label }}
+    # No permissions block on purpose: the job gets the caller job's
+    # permissions (contents: read + pull-requests: read, plus id-token: write
+    # when alerting). Declaring id-token: write here would make every caller
+    # grant it, alerting or not.
+    steps:
+      - name: Classify the pushed commits
+        id: classify
+        # Event text (commit messages) reaches the shell only through env,
+        # never ${{ }} spliced into the script.
+        env:
+          API_URL: ${{ github.api_url }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          zero=0000000000000000000000000000000000000000
+          api() {
+            curl -sSf --retry 2 -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" "$API_URL/repos/$REPO/$1"
+          }
+          echo "pushed by: $ACTOR"
+          if [ "$AFTER" = "$zero" ]; then echo "found=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          if [ "$BEFORE" = "$zero" ]; then shas=$AFTER
+          else shas=$(api "compare/$BEFORE...$AFTER" | jq -r '.commits[].sha'); fi
+
+          violations=""
+          for sha in $shas; do
+            # The commit-to-PR link can be indexed a moment after the push.
+            merged=0
+            for try in 1 2 3; do
+              merged=$(api "commits/$sha/pulls" \
+                | jq '[.[] | select(.merged_at != null and .base.ref == "main")] | length')
+              [ "$merged" -gt 0 ] && break
+              [ "$try" -lt 3 ] && sleep "${DETECT_RETRY_SLEEP:-10}"
+            done
+            if [ "$merged" -gt 0 ]; then echo "ok  ${sha:0:7} merged PR"; continue; fi
+
+            c=$(api "commits/$sha")
+            msg=$(jq -r '.commit.message | split("\n")[0]' <<<"$c")
+            author=$(jq -r '.commit.author.name' <<<"$c")
+            writer=""
+            if [[ $ACTOR == "dvystrcil-ci-cd[bot]" && $author == "homelab-bump-bot" && $msg == "deploy: "* ]]; then
+              writer=release-action
+            elif [[ $ACTOR == "dvystrcil-argocd[bot]" && $author == "argocd-image-updater" && $msg == "build: automatic update of "* ]]; then
+              writer=image-updater
+            fi
+            what="${sha:0:7} $msg ($author, pushed by $ACTOR)"
+            if [ -z "$writer" ]; then
+              violations+="$what: not from a merged PR or a known writer"$'\n'
+              continue
+            fi
+            # A file without a patch (binary, too large) counts as "other".
+            other=$(jq '[.files[] | (.patch // "+?") | split("\n")[]
+                         | select(test("^[-+]")) | select(test("^[-+]\\s*newTag:") | not)] | length' <<<"$c")
+            if [ "$other" -gt 0 ]; then
+              violations+="$what: $writer commit changes more than newTag lines"$'\n'
+            else
+              echo "ok  ${sha:0:7} $writer, newTag lines only"
+            fi
+          done
+
+          if [ -n "$violations" ]; then
+            printf '%s' "$violations"
+            delim="V_$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+            { echo "found=true"; echo "violations<<$delim"; printf '%s' "$violations"; echo "$delim"; } >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch the alert webhook from Infisical
+        if: steps.classify.outputs.found == 'true' && inputs.infisical-domain != '' && inputs.infisical-project-slug != '' && inputs.infisical-identity-id != ''
+        # secret-name: only this one secret. Without it the action exports
+        # the whole store into the job env.
+        uses: Infisical/secrets-action@d2e351f16c6ca20d17c85e6c992e04bdeb64e87d # v1.0.18
+        with:
+          method: oidc
+          identity-id: ${{ inputs.infisical-identity-id }}
+          env-slug: ${{ inputs.infisical-env-slug }}
+          project-slug: ${{ inputs.infisical-project-slug }}
+          secret-path: /
+          secret-name: DISCORD_WEBHOOK_CRITICAL
+          export-type: env
+          domain: ${{ inputs.infisical-domain }}
+
+      - name: Alert on direct push to main
+        # !cancelled(): still report (and fail) when the Infisical fetch
+        # failed or was skipped; the violations must reach the log either way.
+        if: ${{ !cancelled() && steps.classify.outputs.found == 'true' }}
+        env:
+          VIOLATIONS: ${{ steps.classify.outputs.violations }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          SERVER_URL: ${{ github.server_url }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          echo "::error::Commit(s) reached main in $REPO without a merged PR:"
+          printf '%s\n' "$VIOLATIONS"
+          webhook="${DISCORD_WEBHOOK_CRITICAL:-}"
+          if [ -z "$webhook" ]; then
+            echo "DISCORD_WEBHOOK_CRITICAL not set (alerting not configured, or the Infisical fetch failed): no notification sent, but this WAS a direct push to main" >&2
+            exit 1
+          fi
+          msg=$(jq -nc --arg repo "$REPO" --arg actor "$ACTOR" --arg v "$VIOLATIONS" \
+            --arg url "$SERVER_URL/$REPO/commit/$SHA" \
+            '{content: ("🚨 **Direct push to `main`** in `\($repo)` by `\($actor)`, not from a merged PR or a known writer:\n" + ($v | .[0:1500]) + "\n" + $url)}')
+          curl -sf -X POST -H "Content-Type: application/json" -d "$msg" "$webhook"
+          echo "Alert sent."
+          exit 1

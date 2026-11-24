@@ -1,0 +1,39 @@
+# Release base-ci: the next vX.Y.Z with auto-generated release notes, and v1
+# moved to the same commit. Moving v1 IS the release to every caller (they
+# all pin @v1, and base-ci.yaml calls the detector @v1), so it is a decision,
+# not a side effect of merging:
+#   gh workflow run release.yaml --repo dvystrcil/base-ci -f bump=patch
+# A major bump creates v2 and leaves v1 alone (dvystrcil/release-action).
+# Rollback: git tag -f v1 <previous sha> && git push --force origin refs/tags/v1
+
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: patch, minor or major
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # Dispatch lets you pick any branch; a release from one would point v1,
+    # and every caller, at unmerged code.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - id: release
+        uses: dvystrcil/release-action@v1
+        with:
+          token: ${{ github.token }}
+          bump: ${{ inputs.bump }}
+          move-major-tag: true
+      - env:
+          TAG: ${{ steps.release.outputs.tag }}
+          MAJOR: ${{ steps.release.outputs.major-tag }}
+        run: echo "released $TAG; $MAJOR moved"

@@ -1,0 +1,53 @@
+name: ci
+
+# This repo's own CI, on GitHub-hosted runners only: it is public, and
+# public PR code never runs on a shared self-hosted runner.
+#
+#   base         dogfoods base-ci.yaml from this commit (`./`), exactly as a
+#                caller would use it: `base / gitleaks` on every PR and push,
+#                `base / detect-bot-direct-push / check` on pushes to main.
+#                The nested detector call is `@v1`, so this job can't start
+#                until the v1 tag exists (see README, "Versioning").
+#   actionlint   static check of every workflow file, shellcheck included.
+#   tests        the detector's run: blocks executed under bash against a
+#                stub curl, plus wiring checks on both reusable workflows.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  base:
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/base-ci.yaml
+    # No infisical-* inputs: this repo has no Infisical identity, so a direct
+    # push to main here turns the run red without sending an alert.
+
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      # Third-party actions are pinned to a commit SHA.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Lint workflow files
+        # rhysd/actionlint 1.7.12, pinned by image index digest.
+        uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+        env:
+          SHELLCHECK_OPTS: --severity=warning
+        with:
+          args: -color
+
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Unit tests
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet pyyaml==6.0.2
+          "$RUNNER_TEMP/venv/bin/python" -m unittest -v tests.test_detect_bot_direct_push
